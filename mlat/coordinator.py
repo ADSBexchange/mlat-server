@@ -268,7 +268,9 @@ class Coordinator(object):
         ac_count_mlat = len(self.tracker.mlat_wanted)
         ac_count_sync = 0
         now = time.time()
-        for ac in self.tracker.aircraft.values():
+        for i, ac in enumerate(self.tracker.aircraft.values()):
+            if i <= 10:
+                glogger.info(f"aircraft[{i}]: {ac}")
             elapsed_seen = now - ac.seen
             #if elapsed_seen > 3 * 3600:
             #    continue
@@ -334,7 +336,9 @@ class Coordinator(object):
 
         # blacklist receivers with bad clock
         # note this section of code runs every 15 seconds
-        for r in self.receivers.values():
+        for i, r in enumerate(self.receivers.values()):
+            if i <= 20:
+                glogger.info(f"receiver[{i}]: {r}")
             bad_peers = 0
             # count how many peers we have bad sync with
             # don't count peers who have been timed out (state[3] > 0)
