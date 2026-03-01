@@ -258,6 +258,11 @@ class ClockTracker(object):
             k[1].sync_peers[pairing.cat] -= 1
             del self.clock_pairs[k]
 
+        # Centralized sync_points cleanup — replaces the commented-out per-key
+        # call_later(3s) in receiver_sync.  Entries are only useful for ~1-2s
+        # while receivers report the same message pair; clearing every 10s is safe.
+        self.sync_points.clear()
+
     @profile.trackcpu
     def receiver_clock_reset(self, receiver):
         """
