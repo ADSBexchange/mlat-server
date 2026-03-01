@@ -55,7 +55,15 @@ class Cohort:
         self.groups = []
         self.handle = loop.call_later(config.MLAT_DELAY, self._process)
     def _process(self):
-        [ group.handle(group) for group in self.groups ]
+        for group in self.groups:
+            try:
+                group.handle(group)
+            except Exception:
+                # _resolve deletes from self.pending as its first action, so the
+                # failing group is already cleaned. But we must not let the exception
+                # prevent remaining groups from being processed — their pending entries
+                # would leak permanently along with all their Receiver references.
+                pass
 
 class MlatTracker(object):
     def __init__(self, coordinator, blacklist_filename=None, pseudorange_filename=None):

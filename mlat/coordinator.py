@@ -545,10 +545,24 @@ class Coordinator(object):
             try:
                 self._write_state()
                 self.clock_tracker.clear_all_sync_points()
+                self._prune_stale_aircraft()
             except Exception:
                 glogger.exception("Failed to write state files")
 
             await sleep
+
+    def _prune_stale_aircraft(self):
+        """Remove aircraft from the tracker that have no receivers and haven't
+        been seen recently. Without this, TrackedAircraft objects (each holding
+        KalmanStateCA with numpy arrays) accumulate indefinitely."""
+        now = time.time()
+        stale_threshold = now - 3600  # 1 hour
+        stale = [icao for icao, ac in self.tracker.aircraft.items()
+                 if not ac.tracking and ac.seen < stale_threshold]
+        if stale:
+            for icao in stale:
+                del self.tracker.aircraft[icao]
+            glogger.info("Pruned {n} stale aircraft".format(n=len(stale)))
 
     async def write_profile(self):
         while True:
