@@ -438,7 +438,7 @@ class FakeFeeder:
             pass
 
     def _send_raw(self, msg):
-        if self.writer and not self._stop:
+        if self.writer and not self._stop and not self.writer.transport.is_closing():
             try:
                 self.writer.write((json.dumps(msg) + '\n').encode('ascii'))
                 self.messages_sent += 1
@@ -551,7 +551,7 @@ class FakeFeeder:
                 pass
 
     def _send_zlib(self, compressor, msg):
-        if self.writer and not self._stop:
+        if self.writer and not self._stop and not self.writer.transport.is_closing():
             try:
                 line = (json.dumps(msg) + '\n').encode('ascii')
                 compressed = compressor.compress(line) + compressor.flush(zlib.Z_SYNC_FLUSH)
