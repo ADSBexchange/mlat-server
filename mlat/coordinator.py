@@ -31,6 +31,7 @@ import time
 import os
 from contextlib import closing
 import array
+import resource
 
 from mlat import geodesy, profile, constants
 from mlat import tracker, clocktrack, mlattrack, util, config
@@ -221,6 +222,10 @@ class Coordinator(object):
         self.stats_solve_attempt = 0
         self.stats_solve_success = 0
         self.stats_solve_used = 0
+
+        # cumulative counters for Prometheus (never reset)
+        self.stats_pruned_aircraft_total = 0
+        self.stats_cohort_exceptions_total = 0
 
         if status_interval is None:
             status_interval = 15
@@ -499,6 +504,14 @@ class Coordinator(object):
                 out += 'mlat_server_solve_success ' + "{0:.0f}".format(self.stats_solve_success / self.main_interval) + '\n'
                 out += 'mlat_server_solve_used ' + "{0:.0f}".format(self.stats_solve_used / self.main_interval) + '\n'
 
+                out += 'mlat_server_pending_groups ' + str(len(self.mlat_tracker.pending)) + '\n'
+                out += 'mlat_server_bad_sync_receivers ' + str(bad_receivers) + '\n'
+                out += 'mlat_server_clock_pairings ' + str(len(self.clock_tracker.clock_pairs)) + '\n'
+                out += 'mlat_server_pruned_aircraft_total ' + str(self.stats_pruned_aircraft_total) + '\n'
+                out += 'mlat_server_cohort_exceptions_total ' + str(self.stats_cohort_exceptions_total) + '\n'
+                rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+                out += 'mlat_server_rss_bytes ' + str(rss_bytes) + '\n'
+
                 f.write(out)
         except OSError:
             pass
@@ -562,6 +575,7 @@ class Coordinator(object):
         if stale:
             for icao in stale:
                 del self.tracker.aircraft[icao]
+            self.stats_pruned_aircraft_total += len(stale)
             glogger.info("Pruned {n} stale aircraft".format(n=len(stale)))
 
     async def write_profile(self):

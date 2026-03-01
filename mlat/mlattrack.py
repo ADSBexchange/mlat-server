@@ -49,10 +49,11 @@ class MessageGroup:
         self.handle = None
 
 class Cohort:
-    def __init__(self, now, loop):
+    def __init__(self, now, loop, coordinator=None):
         self.creationTime = now
         self.len = 0
         self.groups = []
+        self.coordinator = coordinator
         self.handle = loop.call_later(config.MLAT_DELAY, self._process)
     def _process(self):
         for group in self.groups:
@@ -63,7 +64,8 @@ class Cohort:
                 # failing group is already cleaned. But we must not let the exception
                 # prevent remaining groups from being processed — their pending entries
                 # would leak permanently along with all their Receiver references.
-                pass
+                if self.coordinator:
+                    self.coordinator.stats_cohort_exceptions_total += 1
 
 class MlatTracker(object):
     def __init__(self, coordinator, blacklist_filename=None, pseudorange_filename=None):
@@ -76,7 +78,7 @@ class MlatTracker(object):
         self.read_blacklist()
         self.coordinator.add_sighup_handler(self.read_blacklist)
 
-        self.cohort = Cohort(time.time(), self.loop)
+        self.cohort = Cohort(time.time(), self.loop, self.coordinator)
 
         self.pseudorange_file = None
         self.pseudorange_filename = pseudorange_filename
@@ -116,7 +118,7 @@ class MlatTracker(object):
             group.handle = self._resolve
             if now - self.cohort.creationTime > 0.05 or self.cohort.len > 25:
                 # create new cohort
-                self.cohort = Cohort(now, self.loop)
+                self.cohort = Cohort(now, self.loop, self.coordinator)
 
             self.cohort.groups.append(group)
             self.cohort.len += 1
