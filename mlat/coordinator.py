@@ -511,7 +511,14 @@ class Coordinator(object):
                 out += 'mlat_server_clock_pairings ' + str(len(self.clock_tracker.clock_pairs)) + '\n'
                 out += 'mlat_server_pruned_aircraft_total ' + str(self.stats_pruned_aircraft_total) + '\n'
                 out += 'mlat_server_cohort_exceptions_total ' + str(self.stats_cohort_exceptions_total) + '\n'
-                rss_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+                rss_peak_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+                out += 'mlat_server_rss_peak_bytes ' + str(rss_peak_bytes) + '\n'
+                try:
+                    with open('/proc/self/statm', 'r') as statm:
+                        rss_pages = int(statm.read().split()[1])
+                        rss_bytes = rss_pages * os.sysconf('SC_PAGE_SIZE')
+                except Exception:
+                    rss_bytes = rss_peak_bytes
                 out += 'mlat_server_rss_bytes ' + str(rss_bytes) + '\n'
 
                 f.write(out)
