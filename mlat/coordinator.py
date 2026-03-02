@@ -21,6 +21,8 @@ Top level glue that knows about all receivers and moves data between
 the various sub-objects that make up the server.
 """
 
+import ctypes
+import gc
 import random
 import signal
 import asyncio
@@ -559,6 +561,7 @@ class Coordinator(object):
                 self._write_state()
                 self.clock_tracker.clear_all_sync_points()
                 self._prune_stale_aircraft()
+                self._release_memory()
             except Exception:
                 glogger.exception("Failed to write state files")
 
@@ -577,6 +580,19 @@ class Coordinator(object):
                 del self.tracker.aircraft[icao]
             self.stats_pruned_aircraft_total += len(stale)
             glogger.info("Pruned {n} stale aircraft".format(n=len(stale)))
+
+    def _release_memory(self):
+        """Ask Python and glibc to release freed memory back to the OS.
+
+        CPython's pymalloc and glibc's malloc hold freed pages on internal
+        free lists.  gc.collect() frees circular-reference garbage, and
+        malloc_trim() returns unused heap pages to the OS.
+        """
+        gc.collect()
+        try:
+            ctypes.CDLL(None).malloc_trim(0)
+        except Exception:
+            pass  # not available on all platforms
 
     async def write_profile(self):
         while True:

@@ -13,10 +13,12 @@ solver / cohort / normalization code paths.
 Usage:
     python3 synthetic_load.py --host mlat-server.example.com --port 31090 --feeders 50
     python3 synthetic_load.py --host localhost --port 31090 --feeders 200 --churn-interval 15
+    python3 synthetic_load.py --host localhost --port 31090 --geometric
 
-The generator does NOT produce geometrically accurate multilateration —
-positions won't solve correctly — but it exercises all the server's
-clock-sync, pairing, tracking, cohort, solver, and cleanup paths.
+By default, the generator does NOT produce geometrically accurate
+multilateration — positions won't solve correctly. Use --geometric to
+enable TDOA-consistent timestamps that produce solvable positions over
+Baffin Bay (~72N, -65W).
 """
 
 import argparse
@@ -265,30 +267,240 @@ def make_aircraft_pool(n):
 
 
 # ---------------------------------------------------------------------------
+# Geometric mode — TDOA-consistent timestamps for solvable positions
+# ---------------------------------------------------------------------------
+
+CAIR = 299792458 / 1.00032  # speed of radio in air (m/s), from mlat/constants.py
+
+# WGS84 ellipsoid parameters (matching mlat/geodesy.pyx)
+_WGS84_A = 6378137.0
+_WGS84_F = 1.0 / 298.257223563
+_WGS84_B = _WGS84_A * (1 - _WGS84_F)
+_WGS84_ECC_SQ = 1 - _WGS84_B * _WGS84_B / (_WGS84_A * _WGS84_A)
+
+
+def llh2ecef_pure(lat, lon, alt_m):
+    """WGS84 LLH to ECEF (pure Python, matching mlat/geodesy.pyx)."""
+    lat_r = math.radians(lat)
+    lon_r = math.radians(lon)
+    slat = math.sin(lat_r)
+    clat = math.cos(lat_r)
+    slon = math.sin(lon_r)
+    clon = math.cos(lon_r)
+    d = math.sqrt(1 - slat * slat * _WGS84_ECC_SQ)
+    rn = _WGS84_A / d
+    x = (rn + alt_m) * clat * clon
+    y = (rn + alt_m) * clat * slon
+    z = (rn * (1 - _WGS84_ECC_SQ) + alt_m) * slat
+    return (x, y, z)
+
+
+def ecef_distance_pure(p0, p1):
+    """Euclidean distance between two ECEF points."""
+    return math.sqrt((p0[0] - p1[0])**2 + (p0[1] - p1[1])**2 + (p0[2] - p1[2])**2)
+
+
+class SimulatedClock:
+    """Models a dump1090 12MHz clock with per-receiver PPM error and epoch offset."""
+
+    NOMINAL_FREQ = 12e6
+
+    def __init__(self, ppm_error=None):
+        if ppm_error is None:
+            ppm_error = random.uniform(-50, 50)
+        self.true_freq = self.NOMINAL_FREQ * (1 + ppm_error * 1e-6)
+        self.epoch = random.randint(0, int(86400 * self.NOMINAL_FREQ))
+
+    def timestamp_for(self, wall_time_s):
+        """Convert wall-clock seconds to raw dump1090 clock value."""
+        return int(self.epoch + wall_time_s * self.true_freq)
+
+
+class GeometricAircraftState(AircraftState):
+    """Aircraft with known position, heading-based movement, and ECEF coordinates."""
+
+    def __init__(self, icao_hex, lat, lon, alt_ft, heading_deg, speed_kts):
+        self.icao_hex = icao_hex
+        self.icao_int = int(icao_hex, 16)
+        self.lat = lat
+        self.lon = lon
+        self.alt_ft = alt_ft
+        self.heading_deg = heading_deg
+        self.speed_kts = speed_kts
+        self.ecef = llh2ecef_pure(lat, lon, alt_ft * 0.3048)
+        self._regenerate_messages()
+
+    def step(self):
+        """Move along heading at speed, update ECEF, regenerate DF17 messages."""
+        step_time = 5.0
+        speed_mps = self.speed_kts * 0.514444
+        distance_m = speed_mps * step_time
+        lat_r = math.radians(self.lat)
+        self.lat += (distance_m * math.cos(math.radians(self.heading_deg))) / 111320.0
+        self.lon += (distance_m * math.sin(math.radians(self.heading_deg))) / (111320.0 * math.cos(lat_r))
+        self.ecef = llh2ecef_pure(self.lat, self.lon, self.alt_ft * 0.3048)
+        self._regenerate_messages()
+
+
+# Baffin Bay area — 6 receivers on coastlines, 4 aircraft over the bay
+BAFFIN_RECEIVERS = [
+    # (lat, lon, alt_m, name)
+    (71.3, -65.7, 50, 'clyde-river'),
+    (72.0, -63.5, 30, 'cape-dyer'),
+    (72.8, -66.0, 80, 'pond-inlet-s'),
+    (71.0, -67.0, 120, 'broughton-island'),
+    (73.2, -64.0, 40, 'greenland-w1'),
+    (71.7, -63.0, 60, 'greenland-w2'),
+]
+
+BAFFIN_AIRCRAFT = [
+    # (icao_hex, lat, lon, alt_ft, heading_deg, speed_kts)
+    ('A00001', 72.0, -65.0, 35000, 45, 450),
+    ('A00002', 71.5, -64.5, 28000, 120, 420),
+    ('A00003', 72.5, -66.0, 39000, 270, 460),
+    ('A00004', 71.8, -63.8, 33000, 190, 440),
+]
+
+
+class TransmissionScheduler:
+    """Computes geometrically correct TDOA timestamps based on distance and clock models."""
+
+    def __init__(self, feeder_clocks):
+        """feeder_clocks: {feeder_id: SimulatedClock}"""
+        self.feeder_clocks = feeder_clocks
+        self._wall_time_offset = time.time()
+
+    def _wall_time(self):
+        return time.time() - self._wall_time_offset
+
+    def compute_sync_timestamps(self, aircraft, feeders):
+        """Compute per-feeder (et, ot) timestamps for a sync message pair.
+
+        Returns {feeder_id: (et, ot)} with propagation-delay-correct values.
+        """
+        wall_t = self._wall_time()
+        odd_offset = random.uniform(0.5, 2.0)
+        result = {}
+        for f in feeders:
+            dist = ecef_distance_pure(aircraft.ecef, f.ecef)
+            prop_delay = dist / CAIR
+            clock = self.feeder_clocks[f.feeder_id]
+            et = clock.timestamp_for(wall_t + prop_delay)
+            ot = clock.timestamp_for(wall_t + odd_offset + prop_delay)
+            # dump1090 jitter: ~500ns = ~6 ticks at 12MHz
+            et += random.randint(-6, 6)
+            ot += random.randint(-6, 6)
+            result[f.feeder_id] = (et, ot)
+        return result
+
+    def compute_mlat_timestamps(self, aircraft, feeders):
+        """Compute per-feeder timestamps for a single mlat message.
+
+        Returns {feeder_id: t} with propagation-delay-correct values.
+        """
+        wall_t = self._wall_time()
+        result = {}
+        for f in feeders:
+            dist = ecef_distance_pure(aircraft.ecef, f.ecef)
+            prop_delay = dist / CAIR
+            clock = self.feeder_clocks[f.feeder_id]
+            t = clock.timestamp_for(wall_t + prop_delay)
+            t += random.randint(-6, 6)
+            result[f.feeder_id] = t
+        return result
+
+
+class GeometricBroadcaster:
+    """Centralized coordinator that sends TDOA-consistent sync/mlat messages.
+
+    All in-range feeders receive the same DF17 message with their own
+    propagation-delay-correct timestamp, ensuring the server can match
+    messages and solve positions.
+    """
+
+    def __init__(self, feeders, aircraft, scheduler, mlat_warmup=25.0):
+        self.feeders = feeders
+        self.aircraft = aircraft
+        self.scheduler = scheduler
+        self.mlat_warmup = mlat_warmup
+        self._tasks = []
+
+    async def start(self):
+        self._tasks.append(asyncio.ensure_future(self._sync_loop()))
+        self._tasks.append(asyncio.ensure_future(self._mlat_loop()))
+
+    async def stop(self):
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    def _connected_feeders(self):
+        return [f for f in self.feeders if f.connected]
+
+    async def _sync_loop(self):
+        while True:
+            await asyncio.sleep(random.uniform(0.3, 0.8))
+            connected = self._connected_feeders()
+            if len(connected) < 2:
+                continue
+            ac = random.choice(self.aircraft)
+            timestamps = self.scheduler.compute_sync_timestamps(ac, connected)
+            for f in connected:
+                if f.feeder_id in timestamps:
+                    et, ot = timestamps[f.feeder_id]
+                    f.send_geometric_sync(ac, et, ot)
+
+    async def _mlat_loop(self):
+        await asyncio.sleep(self.mlat_warmup)
+        log.info('Geometric: mlat warmup complete, starting mlat messages')
+        while True:
+            await asyncio.sleep(random.uniform(0.5, 1.5))
+            connected = self._connected_feeders()
+            if len(connected) < 3:
+                continue
+            ac = random.choice(self.aircraft)
+            timestamps = self.scheduler.compute_mlat_timestamps(ac, connected)
+            use_even = random.random() < 0.5
+            for f in connected:
+                if f.feeder_id in timestamps:
+                    f.send_geometric_mlat(ac, timestamps[f.feeder_id], use_even)
+
+
+# ---------------------------------------------------------------------------
 # Fake feeder (simulates a mlat-client connecting to mlat-server)
 # ---------------------------------------------------------------------------
 
 class FakeFeeder:
     """A single fake mlat-client connection."""
 
-    def __init__(self, feeder_id, host, port, aircraft_pool, use_compression=False):
+    def __init__(self, feeder_id, host, port, aircraft_pool, use_compression=False,
+                 geometric_mode=False, sim_clock=None, lat=None, lon=None, alt=None):
         self.feeder_id = feeder_id
         self.host = host
         self.port = port
         self.aircraft_pool = aircraft_pool  # list of AircraftState
         self.use_compression = use_compression
+        self.geometric_mode = geometric_mode
+        self.sim_clock = sim_clock
 
         self.user = f'loadgen-{feeder_id:04d}'
-        # Spread feeders across a ~200km area (US midwest-ish)
-        self.lat = 39.0 + random.uniform(-1.0, 1.0)
-        self.lon = -94.0 + random.uniform(-1.0, 1.0)
-        self.alt = random.uniform(100, 500)
+        if lat is not None:
+            self.lat = lat
+            self.lon = lon
+            self.alt = alt
+        else:
+            # Spread feeders across a ~200km area (US midwest-ish)
+            self.lat = 39.0 + random.uniform(-1.0, 1.0)
+            self.lon = -94.0 + random.uniform(-1.0, 1.0)
+            self.alt = random.uniform(100, 500)
+        self.ecef = llh2ecef_pure(self.lat, self.lon, self.alt) if geometric_mode else None
 
         self.reader = None
         self.writer = None
         self.connected = False
         self._stop = False
         self._task = None
+        self._compressor = None  # set during zlib negotiation
 
         # dump1090-style 12 MHz clock
         self.clock_freq = 12e6
@@ -393,15 +605,16 @@ class FakeFeeder:
                 await asyncio.sleep(random.uniform(0.3, 1.0))
                 tick += 1
 
-                # Send correlated sync messages (most common) — uses shared
-                # DF17 message pairs so multiple feeders create clock pairings
-                if random.random() < 0.7:
-                    self._send_correlated_sync_raw()
+                if not self.geometric_mode:
+                    # Send correlated sync messages (most common) — uses shared
+                    # DF17 message pairs so multiple feeders create clock pairings
+                    if random.random() < 0.7:
+                        self._send_correlated_sync_raw()
 
-                # Send correlated mlat messages — same message from multiple
-                # feeders exercises the cohort/solver path
-                if random.random() < 0.3:
-                    self._send_correlated_mlat_raw()
+                    # Send correlated mlat messages — same message from multiple
+                    # feeders exercises the cohort/solver path
+                    if random.random() < 0.3:
+                        self._send_correlated_mlat_raw()
 
                 # Periodic seen/lost updates
                 if tick % 10 == 0:
@@ -490,12 +703,34 @@ class FakeFeeder:
             }
         })
 
+    def send_message(self, msg):
+        """Send a message, dispatching to raw or zlib as negotiated."""
+        if self._compressor is not None:
+            self._send_zlib(self._compressor, msg)
+        else:
+            self._send_raw(msg)
+
+    def send_geometric_sync(self, aircraft, et, ot):
+        """Send a sync message with broadcaster-computed timestamps."""
+        self.send_message({
+            'sync': {'et': et, 'ot': ot, 'em': aircraft.even_msg, 'om': aircraft.odd_msg}
+        })
+
+    def send_geometric_mlat(self, aircraft, t, use_even):
+        """Send an mlat message with broadcaster-computed timestamp."""
+        m = aircraft.even_msg if use_even else aircraft.odd_msg
+        self.send_message({'mlat': {'t': t, 'm': m}})
+
     def _update_visible_aircraft(self):
         """Randomly adjust which aircraft this feeder sees.
 
         Aircraft are drawn from the shared pool so multiple feeders see
         the same aircraft and send correlated messages.
+        In geometric mode, all aircraft are always visible.
         """
+        if self.geometric_mode:
+            self.visible_aircraft = list(self.aircraft_pool)
+            return
         pool = self.aircraft_pool
         target_count = random.randint(5, min(30, len(pool)))
 
@@ -518,6 +753,7 @@ class FakeFeeder:
     async def _message_loop_zlib(self, compress_mode):
         """Send/receive loop with zlib compression."""
         compressor = zlib.compressobj(1)
+        self._compressor = compressor  # store for geometric broadcaster access
         decompressor = zlib.decompressobj()
 
         self._update_visible_aircraft()
@@ -530,11 +766,12 @@ class FakeFeeder:
                 await asyncio.sleep(random.uniform(0.3, 1.0))
                 tick += 1
 
-                if random.random() < 0.7:
-                    self._send_correlated_sync_zlib(compressor)
+                if not self.geometric_mode:
+                    if random.random() < 0.7:
+                        self._send_correlated_sync_zlib(compressor)
 
-                if random.random() < 0.3:
-                    self._send_correlated_mlat_zlib(compressor)
+                    if random.random() < 0.3:
+                        self._send_correlated_mlat_zlib(compressor)
 
                 if tick % 10 == 0:
                     self._update_visible_aircraft()
@@ -680,28 +917,64 @@ async def move_aircraft(aircraft_pool, interval=5.0):
 
 
 async def main(args):
-    aircraft_pool = make_aircraft_pool(args.aircraft)
-    log.info('Created pool of %d fake aircraft with valid DF17 messages', len(aircraft_pool))
+    broadcaster = None
 
-    feeders = []
-    for i in range(args.feeders):
-        f = FakeFeeder(
-            feeder_id=i,
-            host=args.host,
-            port=args.port,
-            aircraft_pool=aircraft_pool,
-            use_compression=args.compress,
-        )
-        feeders.append(f)
+    if args.geometric:
+        # Geometric mode: fixed Baffin Bay positions with TDOA-correct timestamps
+        aircraft_pool = [
+            GeometricAircraftState(icao, lat, lon, alt, hdg, spd)
+            for icao, lat, lon, alt, hdg, spd in BAFFIN_AIRCRAFT
+        ]
+        log.info('Geometric mode: %d aircraft over Baffin Bay', len(aircraft_pool))
+
+        feeder_clocks = {}
+        feeders = []
+        for i, (rlat, rlon, ralt, rname) in enumerate(BAFFIN_RECEIVERS):
+            clock = SimulatedClock()
+            feeder_clocks[i] = clock
+            f = FakeFeeder(
+                feeder_id=i,
+                host=args.host,
+                port=args.port,
+                aircraft_pool=aircraft_pool,
+                use_compression=args.compress,
+                geometric_mode=True,
+                sim_clock=clock,
+                lat=rlat, lon=rlon, alt=ralt,
+            )
+            feeders.append(f)
+            log.info('  Receiver %d: %s (%.1f, %.1f)', i, rname, rlat, rlon)
+
+        scheduler = TransmissionScheduler(feeder_clocks)
+        broadcaster = GeometricBroadcaster(feeders, aircraft_pool, scheduler)
+    else:
+        aircraft_pool = make_aircraft_pool(args.aircraft)
+        log.info('Created pool of %d fake aircraft with valid DF17 messages', len(aircraft_pool))
+
+        feeders = []
+        for i in range(args.feeders):
+            f = FakeFeeder(
+                feeder_id=i,
+                host=args.host,
+                port=args.port,
+                aircraft_pool=aircraft_pool,
+                use_compression=args.compress,
+            )
+            feeders.append(f)
 
     # Start feeders with staggered connects
-    log.info('Starting %d feeders against %s:%d ...', args.feeders, args.host, args.port)
+    log.info('Starting %d feeders against %s:%d ...', len(feeders), args.host, args.port)
     for i, feeder in enumerate(feeders):
         await feeder.start()
         if i < len(feeders) - 1:
             await asyncio.sleep(args.connect_delay)
 
     log.info('All feeders started')
+
+    # Start geometric broadcaster if enabled
+    if broadcaster:
+        await broadcaster.start()
+        log.info('Geometric broadcaster started (mlat warmup: %.0fs)', broadcaster.mlat_warmup)
 
     # Start aircraft movement (regenerates DF17 messages periodically)
     aircraft_task = asyncio.ensure_future(move_aircraft(aircraft_pool, interval=5.0))
@@ -727,6 +1000,8 @@ async def main(args):
 
     stats_task.cancel()
     aircraft_task.cancel()
+    if broadcaster:
+        await broadcaster.stop()
     if churn:
         await churn.stop()
 
@@ -747,6 +1022,8 @@ def parse_args():
     p.add_argument('--connect-delay', type=float, default=0.1,
                    help='delay between feeder connections in seconds (default: 0.1)')
     p.add_argument('--compress', action='store_true', help='use zlib compression')
+    p.add_argument('--geometric', action='store_true',
+                   help='enable TDOA-consistent timestamps for solvable positions over Baffin Bay')
     return p.parse_args()
 
 
