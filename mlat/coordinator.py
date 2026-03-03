@@ -21,6 +21,8 @@ Top level glue that knows about all receivers and moves data between
 the various sub-objects that make up the server.
 """
 
+import ctypes
+import gc
 import random
 import signal
 import asyncio
@@ -31,6 +33,7 @@ import time
 import os
 from contextlib import closing
 import array
+import resource
 
 from mlat import geodesy, profile, constants
 from mlat import tracker, clocktrack, mlattrack, util, config
@@ -221,6 +224,10 @@ class Coordinator(object):
         self.stats_solve_attempt = 0
         self.stats_solve_success = 0
         self.stats_solve_used = 0
+
+        # cumulative counters for Prometheus (never reset)
+        self.stats_pruned_aircraft_total = 0
+        self.stats_cohort_exceptions_total = 0
 
         if status_interval is None:
             status_interval = 15
@@ -499,6 +506,21 @@ class Coordinator(object):
                 out += 'mlat_server_solve_success ' + "{0:.0f}".format(self.stats_solve_success / self.main_interval) + '\n'
                 out += 'mlat_server_solve_used ' + "{0:.0f}".format(self.stats_solve_used / self.main_interval) + '\n'
 
+                out += 'mlat_server_pending_groups ' + str(len(self.mlat_tracker.pending)) + '\n'
+                out += 'mlat_server_bad_sync_receivers ' + str(bad_receivers) + '\n'
+                out += 'mlat_server_clock_pairings ' + str(len(self.clock_tracker.clock_pairs)) + '\n'
+                out += 'mlat_server_pruned_aircraft_total ' + str(self.stats_pruned_aircraft_total) + '\n'
+                out += 'mlat_server_cohort_exceptions_total ' + str(self.stats_cohort_exceptions_total) + '\n'
+                rss_peak_bytes = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+                out += 'mlat_server_rss_peak_bytes ' + str(rss_peak_bytes) + '\n'
+                try:
+                    with open('/proc/self/statm', 'r') as statm:
+                        rss_pages = int(statm.read().split()[1])
+                        rss_bytes = rss_pages * os.sysconf('SC_PAGE_SIZE')
+                except Exception:
+                    rss_bytes = rss_peak_bytes
+                out += 'mlat_server_rss_bytes ' + str(rss_bytes) + '\n'
+
                 f.write(out)
         except OSError:
             pass
@@ -545,10 +567,39 @@ class Coordinator(object):
             try:
                 self._write_state()
                 self.clock_tracker.clear_all_sync_points()
+                self._prune_stale_aircraft()
+                self._release_memory()
             except Exception:
                 glogger.exception("Failed to write state files")
 
             await sleep
+
+    def _prune_stale_aircraft(self):
+        """Remove aircraft from the tracker that have no receivers and haven't
+        been seen recently. Without this, TrackedAircraft objects (each holding
+        KalmanStateCA with numpy arrays) accumulate indefinitely."""
+        now = time.time()
+        stale_threshold = now - 3600  # 1 hour
+        stale = [icao for icao, ac in self.tracker.aircraft.items()
+                 if not ac.tracking and ac.seen < stale_threshold]
+        if stale:
+            for icao in stale:
+                del self.tracker.aircraft[icao]
+            self.stats_pruned_aircraft_total += len(stale)
+            glogger.info("Pruned {n} stale aircraft".format(n=len(stale)))
+
+    def _release_memory(self):
+        """Ask Python and glibc to release freed memory back to the OS.
+
+        CPython's pymalloc and glibc's malloc hold freed pages on internal
+        free lists.  gc.collect() frees circular-reference garbage, and
+        malloc_trim() returns unused heap pages to the OS.
+        """
+        gc.collect()
+        try:
+            ctypes.CDLL(None).malloc_trim(0)
+        except Exception:
+            pass  # not available on all platforms
 
     async def write_profile(self):
         while True:

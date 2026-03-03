@@ -88,13 +88,17 @@ class MonitoringListener(object):
     async def monitor_client(self, client):
         try:
             await client.wait_closed()
+        except Exception:
+            self.logger.exception('Exception monitoring client')
+        finally:
+            # always clean up client and task references, even if wait_closed()
+            # raises — otherwise the client list grows permanently, pinning
+            # dead JsonClient objects and their entire Receiver reference graph
             if client in self.clients:
                 self.clients.remove(client)
             task = asyncio.current_task()
             if task in self.monitoring:
                 self.monitoring.remove(task)
-        except Exception:
-            self.logger.exception('Exception monitoring client')
 
     def close(self):
         if not self.started:

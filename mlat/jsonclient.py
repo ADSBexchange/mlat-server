@@ -252,6 +252,13 @@ class JsonClient(connection.Connection):
         self.transport.close()
         self.transport = None
 
+        # break circular references so the GC can collect the Receiver and
+        # JsonClient immediately instead of waiting for cyclic GC
+        self.receiver = None
+        self.coordinator = None
+        self._compressor = None
+        self._decompressor = None
+
     async def wait_closed(self):
         await util.safe_wait([self._read_task, self._heartbeat_task])
 
