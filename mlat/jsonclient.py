@@ -35,6 +35,7 @@ import re
 
 from mlat import constants, geodesy
 from mlat import net, util, connection, config
+from mlat import receiver_identity
 
 
 glogger = logging.getLogger("client")
@@ -361,8 +362,28 @@ class JsonClient(connection.Connection):
                 if user in self.coordinator.usernames:
                     existingReceiver = self.coordinator.usernames[user]
 
+                    # Best-effort reported position of this connection, used only to corroborate a
+                    # same-IP reconnect below. Parsed defensively here; the authoritative parse and
+                    # validation happen further down.
+                    try:
+                        new_lat = float(hs['lat'])
+                        new_lon = float(hs['lon'])
+                        if new_lon > 180:
+                            new_lon = new_lon - 180
+                    except (KeyError, ValueError, TypeError):
+                        new_lat = new_lon = None
+
                     if uuid and uuid == existingReceiver.uuid:
                         # if we have another user with the same uuid, disconnect the existing user
+                        existingReceiver.connection.close()
+                    elif receiver_identity.is_same_receiver(
+                            existingReceiver.connection.source_ip,
+                            existingReceiver.position_llh[0], existingReceiver.position_llh[1],
+                            self.source_ip, new_lat, new_lon):
+                        # No uuid to match on, but the same source IP and position: this is the
+                        # same feeder reconnecting before its previous session was reaped. Drop the
+                        # stale session and keep the name, rather than minting a new random name
+                        # (which would create a fresh identity downstream on every reconnect).
                         existingReceiver.connection.close()
                     else:
                         tries = 1000
