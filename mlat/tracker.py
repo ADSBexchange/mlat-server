@@ -167,18 +167,24 @@ class Tracker(object):
                 del self.aircraft[icao]
 
     def remove_all(self, receiver):
-        for ac in receiver.tracking:
+        # A receiver can sit in an aircraft's adsb_seen / sync_interest / mlat_interest
+        # without tracking that aircraft (interest sets are built from rate reports),
+        # so walk every set that links the two.
+        linked = (receiver.tracking | receiver.adsb_seen | receiver.sync_interest
+                  | receiver.mlat_interest | receiver.requested)
+        for ac in linked:
             ac.tracking.discard(receiver)
             ac.sync_interest.discard(receiver)
             ac.adsb_seen.discard(receiver)
             ac.mlat_interest.discard(receiver)
-            if not ac.tracking:
+            if not ac.tracking and self.aircraft.get(ac.icao) is ac:
                 del self.aircraft[ac.icao]
 
         receiver.tracking.clear()
         receiver.adsb_seen.clear()
         receiver.sync_interest.clear()
         receiver.mlat_interest.clear()
+        receiver.requested.clear()
 
     @profile.trackcpu
     def update_interest(self, receiver):
