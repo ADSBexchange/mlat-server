@@ -273,7 +273,10 @@ class ClockTracker(object):
         Only reset the offsets, the drift shouldn't be affected
         """
         cdef ClockPairing pairing
-        for k, pairing in list(self.clock_pairs.items()):
+        # Iterate the dict in place: reset_offsets() does not add or remove keys,
+        # and building a list of every pair on each call allocates enough objects
+        # to trigger frequent full garbage collections.
+        for k, pairing in self.clock_pairs.items():
             if k[0] is receiver or k[1] is receiver:
                 pairing.reset_offsets()
 
@@ -294,11 +297,12 @@ class ClockTracker(object):
         cdef ClockPairing pairing
         # Clean up clock_pairs immediately.
         # Any membership in a pending sync point is noticed when we try to sync more receivers with it.
-        for k, pairing in list(self.clock_pairs.items()):
-            if k[0] is receiver or k[1] is receiver:
-                k[0].sync_peers[pairing.cat] -= 1
-                k[1].sync_peers[pairing.cat] -= 1
-                del self.clock_pairs[k]
+        matched = [(k, pairing) for k, pairing in self.clock_pairs.items()
+                   if k[0] is receiver or k[1] is receiver]
+        for k, pairing in matched:
+            k[0].sync_peers[pairing.cat] -= 1
+            k[1].sync_peers[pairing.cat] -= 1
+            del self.clock_pairs[k]
 
     @profile.trackcpu
     def receiver_sync(self, receiver,
