@@ -703,6 +703,7 @@ class Coordinator(object):
         # clean up old distance entries
         for other_receiver in self.receivers.values():
             other_receiver.distance.pop(receiver.uid, None)
+        receiver.distance.clear()
 
     @profile.trackcpu
     def receiver_tracking_add(self, receiver, icao_set):
