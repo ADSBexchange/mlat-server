@@ -584,7 +584,7 @@ class Coordinator(object):
                  if not ac.tracking and ac.seen < stale_threshold]
         if stale:
             for icao in stale:
-                del self.tracker.aircraft[icao]
+                self.tracker.drop_aircraft(self.tracker.aircraft[icao])
             self.stats_pruned_aircraft_total += len(stale)
             glogger.info("Pruned {n} stale aircraft".format(n=len(stale)))
 

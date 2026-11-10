@@ -164,7 +164,7 @@ class Tracker(object):
             ac.tracking.discard(receiver)
             receiver.tracking.discard(ac)
             if not ac.tracking:
-                del self.aircraft[icao]
+                self.drop_aircraft(ac)
 
     def remove_all(self, receiver):
         # A receiver can sit in an aircraft's adsb_seen / sync_interest / mlat_interest
@@ -177,14 +177,33 @@ class Tracker(object):
             ac.sync_interest.discard(receiver)
             ac.adsb_seen.discard(receiver)
             ac.mlat_interest.discard(receiver)
-            if not ac.tracking and self.aircraft.get(ac.icao) is ac:
-                del self.aircraft[ac.icao]
+            if not ac.tracking:
+                self.drop_aircraft(ac)
 
         receiver.tracking.clear()
         receiver.adsb_seen.clear()
         receiver.sync_interest.clear()
         receiver.mlat_interest.clear()
         receiver.requested.clear()
+
+    def drop_aircraft(self, ac):
+        """Remove an aircraft from the tracker and from the interest sets of the
+        receivers it still lists, so no receiver keeps a reference to it."""
+        if self.aircraft.get(ac.icao) is ac:
+            del self.aircraft[ac.icao]
+
+        for r in ac.sync_interest:
+            r.sync_interest.discard(ac)
+            r.requested.discard(ac)
+        for r in ac.mlat_interest:
+            r.mlat_interest.discard(ac)
+            r.requested.discard(ac)
+        for r in ac.adsb_seen:
+            r.adsb_seen.discard(ac)
+
+        ac.sync_interest.clear()
+        ac.mlat_interest.clear()
+        ac.adsb_seen.clear()
 
     @profile.trackcpu
     def update_interest(self, receiver):

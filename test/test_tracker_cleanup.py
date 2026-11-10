@@ -11,7 +11,7 @@ import unittest
 import weakref
 
 from mlat import tracker
-from mlat.coordinator import Receiver, clocktrack
+from mlat.coordinator import Coordinator, Receiver, clocktrack
 
 
 class _Loop:
@@ -97,6 +97,68 @@ class RemoveAllTests(unittest.TestCase):
         self.tracker.remove_all(a)
 
         self.assertIs(self.tracker.aircraft.get(0x100), current)
+
+
+class DropAircraftTests(unittest.TestCase):
+    def setUp(self):
+        self.tracker = tracker.Tracker(coordinator=None, partition=(1, 1), loop=_Loop())
+        self.a, self.b = _receiver(1), _receiver(2)
+        self.tracker.add(self.b, {0x100, 0x200})
+        # a tracks only 0x100 but has interest in 0x200 from its rate report
+        self.tracker.add(self.a, {0x100})
+        acs = {self.tracker.aircraft[i] for i in (0x100, 0x200)}
+        self.a.update_interest_sets(acs, acs, acs)
+        self.a.refresh_traffic_requests()
+
+    def _assert_unlinked(self, ac):
+        for s in (self.a.sync_interest, self.a.mlat_interest, self.a.adsb_seen, self.a.requested):
+            self.assertNotIn(ac, s)
+        for s in (ac.sync_interest, ac.mlat_interest, ac.adsb_seen):
+            self.assertEqual(len(s), 0)
+
+    def test_remove_unlinks_dropped_aircraft_from_other_receivers(self):
+        ac = self.tracker.aircraft[0x200]
+
+        self.tracker.remove(self.b, {0x200})
+
+        self.assertNotIn(0x200, self.tracker.aircraft)
+        self._assert_unlinked(ac)
+        self.assertIn(self.tracker.aircraft[0x100], self.a.sync_interest)
+
+    def test_dropped_aircraft_is_collectable(self):
+        ref = weakref.ref(self.tracker.aircraft[0x200])
+
+        self.tracker.remove(self.b, {0x200})
+        gc.collect()
+
+        self.assertIsNone(ref())
+
+    def test_remove_all_unlinks_dropped_aircraft_from_other_receivers(self):
+        ac = self.tracker.aircraft[0x200]
+
+        self.tracker.remove_all(self.b)
+
+        self.assertNotIn(0x200, self.tracker.aircraft)
+        self._assert_unlinked(ac)
+
+    def test_prune_unlinks_stale_aircraft(self):
+        ac = self.tracker.aircraft[0x200]
+        self.tracker.remove(self.b, {0x200})
+        # re-add an untracked entry with interest links, as left by older state
+        self.tracker.aircraft[0x200] = ac
+        ac.seen = 0
+        ac.sync_interest.add(self.a)
+        self.a.sync_interest.add(ac)
+
+        class _Coord:
+            stats_pruned_aircraft_total = 0
+        coord = _Coord()
+        coord.tracker = self.tracker
+        Coordinator._prune_stale_aircraft(coord)
+
+        self.assertNotIn(0x200, self.tracker.aircraft)
+        self._assert_unlinked(ac)
+        self.assertEqual(coord.stats_pruned_aircraft_total, 1)
 
 
 class ClockTrackerReceiverTests(unittest.TestCase):
