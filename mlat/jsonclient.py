@@ -301,7 +301,8 @@ class JsonClient(connection.Connection):
         #self.logger.info("Accepted new client connection")
 
         try:
-            await self.process_handshake()
+            if not await self.process_handshake():
+                return
 
             # start heartbeat handling now that the handshake is done
             self._last_message_time = time.time()
